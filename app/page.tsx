@@ -1,69 +1,330 @@
-import Image from "next/image";
+"use client";
 
-export default function Home() {
+import { useEffect, useRef, useState } from "react";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { START_MESSAGE } from "@/lib/prompt";
+import type { Message, RespondResult } from "@/lib/types";
+
+const HISTORY_LIMIT = 20;
+const MAX_RECORDING_SECONDS = 60;
+const AUDIO_MIME = "audio/webm";
+
+type FeedItem =
+  | { id: string; kind: "user"; text: string }
+  | { id: string; kind: "assistant"; result: RespondResult }
+  | { id: string; kind: "assistant-plain"; text: string }
+  | { id: string; kind: "pending"; label: string }
+  | { id: string; kind: "notice"; text: string };
+
+function newId() {
+  return Math.random().toString(36).slice(2);
+}
+
+function startFeed(): FeedItem[] {
+  return [{ id: newId(), kind: "assistant-plain", text: START_MESSAGE }];
+}
+
+function startHistory(): Message[] {
+  return [{ role: "assistant", text: START_MESSAGE }];
+}
+
+function formatTime(total: number) {
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+export default function Page() {
+  const [feed, setFeed] = useState<FeedItem[]>(startFeed);
+  const [history, setHistory] = useState<Message[]>(startHistory);
+  const [draft, setDraft] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [recording, setRecording] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
+  const [micError, setMicError] = useState<string | null>(null);
+
+  const bottomRef = useRef<HTMLDivElement>(null);
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+  const tickRef = useRef<number | null>(null);
+  const limitRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [feed]);
+
+  function replace(id: string, next: FeedItem) {
+    setFeed((prev) => prev.map((item) => (item.id === id ? next : item)));
+  }
+
+  function append(item: FeedItem) {
+    setFeed((prev) => [...prev, item]);
+  }
+
+  function reset() {
+    setFeed(startFeed());
+    setHistory(startHistory());
+    setDraft("");
+  }
+
+  // Шаг раунда: история + реплика уходят в модель, ответ становится карточкой.
+  async function runRespond(text: string) {
+    const pendingId = newId();
+    append({ id: pendingId, kind: "pending", label: "Думаю..." });
+
+    const res = await fetch("/api/respond", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ history, userText: text }),
+    });
+
+    if (!res.ok) {
+      replace(pendingId, {
+        id: pendingId,
+        kind: "notice",
+        text: "Не получилось разобрать, попробуйте ещё раз.",
+      });
+      return;
+    }
+
+    const result = (await res.json()) as RespondResult;
+    replace(pendingId, { id: pendingId, kind: "assistant", result });
+
+    // В историю идёт сырая реплика пользователя и только reply бота.
+    // Corrected и explanation в историю не попадают никогда.
+    setHistory((prev) =>
+      [
+        ...prev,
+        { role: "user" as const, text },
+        { role: "assistant" as const, text: result.reply },
+      ].slice(-HISTORY_LIMIT),
+    );
+  }
+
+  async function sendText(userText: string) {
+    const text = userText.trim();
+    if (!text || busy) return;
+
+    setBusy(true);
+    append({ id: newId(), kind: "user", text });
+
+    try {
+      await runRespond(text);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function sendVoice(blob: Blob) {
+    if (busy) return;
+
+    setBusy(true);
+    const listeningId = newId();
+    append({ id: listeningId, kind: "pending", label: "Слушаю..." });
+
+    try {
+      const form = new FormData();
+      form.append("audio", blob, "audio.webm");
+
+      const res = await fetch("/api/transcribe", { method: "POST", body: form });
+
+      if (!res.ok) {
+        replace(listeningId, {
+          id: listeningId,
+          kind: "notice",
+          text: "Что-то сломалось, попробуйте ещё раз.",
+        });
+        return;
+      }
+
+      const { text } = (await res.json()) as { text: string };
+      const userText = text.trim();
+
+      if (!userText) {
+        replace(listeningId, {
+          id: listeningId,
+          kind: "notice",
+          text: "Ничего не расслышал, скажите ещё раз.",
+        });
+        return;
+      }
+
+      replace(listeningId, { id: listeningId, kind: "user", text: userText });
+      await runRespond(userText);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function stopRecording() {
+    if (tickRef.current !== null) {
+      window.clearInterval(tickRef.current);
+      tickRef.current = null;
+    }
+    if (limitRef.current !== null) {
+      window.clearTimeout(limitRef.current);
+      limitRef.current = null;
+    }
+
+    const recorder = recorderRef.current;
+    recorderRef.current = null;
+    setRecording(false);
+
+    if (recorder && recorder.state !== "inactive") recorder.stop();
+  }
+
+  async function startRecording() {
+    if (busy || recorderRef.current) return;
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const recorder = new MediaRecorder(stream, { mimeType: AUDIO_MIME });
+      chunksRef.current = [];
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) chunksRef.current.push(event.data);
+      };
+
+      recorder.onstop = () => {
+        stream.getTracks().forEach((track) => track.stop());
+        const blob = new Blob(chunksRef.current, { type: AUDIO_MIME });
+        chunksRef.current = [];
+        if (blob.size > 0) void sendVoice(blob);
+      };
+
+      recorderRef.current = recorder;
+      recorder.start();
+
+      setMicError(null);
+      setRecording(true);
+      setElapsed(0);
+
+      tickRef.current = window.setInterval(
+        () => setElapsed((value) => value + 1),
+        1000,
+      );
+      limitRef.current = window.setTimeout(
+        () => stopRecording(),
+        MAX_RECORDING_SECONDS * 1000,
+      );
+    } catch (error) {
+      console.error("Не удалось начать запись", error);
+      setMicError("Нужен доступ к микрофону");
+    }
+  }
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert h-5 w-[100px]"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the{" "}
-            <code className="rounded bg-black/[.06] px-1.5 py-0.5 font-mono text-[0.9em] dark:bg-white/[.08]">
-              page.tsx
-            </code>{" "}
-            file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert h-[14px] w-4"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={14}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
-    </div>
+    <main className="mx-auto flex h-dvh w-full max-w-2xl flex-col p-4">
+      <div className="flex-1 space-y-3 overflow-y-auto pb-4">
+        {feed.map((item) => {
+          if (item.kind === "user") {
+            return (
+              <div key={item.id} className="flex justify-end">
+                <div className="bg-primary text-primary-foreground max-w-[80%] rounded-lg px-3 py-2 text-sm">
+                  {item.text}
+                </div>
+              </div>
+            );
+          }
+
+          if (item.kind === "assistant-plain") {
+            return (
+              <Card key={item.id} className="max-w-[90%]">
+                <CardContent className="text-lg font-medium">
+                  {item.text}
+                </CardContent>
+              </Card>
+            );
+          }
+
+          if (item.kind === "notice") {
+            return (
+              <Card key={item.id} className="max-w-[90%]">
+                <CardContent className="text-muted-foreground text-sm">
+                  {item.text}
+                </CardContent>
+              </Card>
+            );
+          }
+
+          if (item.kind === "pending") {
+            return (
+              <div
+                key={item.id}
+                className="text-muted-foreground px-3 py-2 text-sm"
+              >
+                {item.label}
+              </div>
+            );
+          }
+
+          return (
+            <Card key={item.id} className="max-w-[90%]">
+              <CardContent className="space-y-3">
+                <p className="text-sm">
+                  <span className="text-muted-foreground">Corrected: </span>
+                  {item.result.corrected}
+                </p>
+                <p className="text-muted-foreground text-sm whitespace-pre-line">
+                  {item.result.explanation}
+                </p>
+                <p className="text-lg font-medium">{item.result.reply}</p>
+              </CardContent>
+            </Card>
+          );
+        })}
+        <div ref={bottomRef} />
+      </div>
+
+      <div className="space-y-3 border-t pt-4">
+        {micError && (
+          <p className="text-destructive text-center text-sm">{micError}</p>
+        )}
+
+        <Button
+          size="lg"
+          variant={recording ? "destructive" : "default"}
+          className="h-16 w-full touch-none text-base select-none"
+          disabled={busy}
+          onContextMenu={(e) => e.preventDefault()}
+          onPointerDown={(e) => {
+            e.currentTarget.setPointerCapture(e.pointerId);
+            void startRecording();
+          }}
+          onPointerUp={stopRecording}
+          onPointerCancel={stopRecording}
+        >
+          {recording
+            ? `Отпустите  ${formatTime(elapsed)}`
+            : "Держите и говорите"}
+        </Button>
+
+        <form
+          className="flex gap-2"
+          onSubmit={(e) => {
+            e.preventDefault();
+            const text = draft;
+            setDraft("");
+            void sendText(text);
+          }}
+        >
+          <Input
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            placeholder="Или напишите ответ текстом"
+            disabled={busy}
+          />
+          <Button type="submit" disabled={busy || !draft.trim()}>
+            Отправить
+          </Button>
+        </form>
+
+        <Button variant="outline" className="w-full" onClick={reset}>
+          Начать заново
+        </Button>
+      </div>
+    </main>
   );
 }
