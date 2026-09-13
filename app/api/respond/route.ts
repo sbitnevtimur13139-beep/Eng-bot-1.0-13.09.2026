@@ -1,8 +1,14 @@
 import { ParseError, respond } from "@/lib/llm";
+import { auth } from "@/lib/auth";
 import type { Message } from "@/lib/types";
 
 export async function POST(req: Request) {
   try {
+    const session = await auth.api.getSession({ headers: req.headers });
+    if (!session) {
+      return Response.json({ error: "unauthorized" }, { status: 401 });
+    }
+
     const { history, userText } = (await req.json()) as {
       history: Message[];
       userText: string;
