@@ -6,7 +6,7 @@ export async function POST(req: Request) {
     const audio = form.get("audio");
 
     if (!(audio instanceof File)) {
-      return new Response("no audio", { status: 400 });
+      return Response.json({ error: "failed" }, { status: 400 });
     }
 
     const text = await transcribe(audio);
@@ -14,6 +14,6 @@ export async function POST(req: Request) {
     return Response.json({ text });
   } catch (error) {
     console.error("POST /api/transcribe", error);
-    return new Response("transcribe failed", { status: 500 });
+    return Response.json({ error: "failed" }, { status: 500 });
   }
 }

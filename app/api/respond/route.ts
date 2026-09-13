@@ -1,4 +1,4 @@
-import { respond } from "@/lib/llm";
+import { ParseError, respond } from "@/lib/llm";
 import type { Message } from "@/lib/types";
 
 export async function POST(req: Request) {
@@ -13,6 +13,10 @@ export async function POST(req: Request) {
     return Response.json(result);
   } catch (error) {
     console.error("POST /api/respond", error);
-    return new Response("respond failed", { status: 500 });
+
+    // parse — модель ответила мусором, failed — всё остальное.
+    const kind = error instanceof ParseError ? "parse" : "failed";
+
+    return Response.json({ error: kind }, { status: 500 });
   }
 }

@@ -6,6 +6,14 @@ import type { Message, RespondResult } from "./types";
 const CHAT_MODEL = "gpt-4o-mini";
 const MAX_ATTEMPTS = 2;
 
+/** Модель ответила, но её JSON не разобрался или в нём нет нужных полей. */
+export class ParseError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ParseError";
+  }
+}
+
 let client: OpenAI | null = null;
 
 function getClient() {
@@ -22,7 +30,7 @@ function parseResult(raw: string): RespondResult {
     typeof explanation !== "string" ||
     typeof reply !== "string"
   ) {
-    throw new Error("respond: в ответе модели нет одного из трёх полей");
+    throw new ParseError("respond: в ответе модели нет одного из трёх полей");
   }
 
   return { corrected, explanation, reply };
@@ -57,5 +65,7 @@ export async function respond(
     }
   }
 
-  throw lastError;
+  throw new ParseError(
+    `respond: ответ модели не разобран за ${MAX_ATTEMPTS} попытки: ${String(lastError)}`,
+  );
 }
