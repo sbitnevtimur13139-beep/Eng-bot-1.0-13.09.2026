@@ -11,6 +11,11 @@ const HISTORY_LIMIT = 20;
 const MAX_RECORDING_SECONDS = 60;
 const AUDIO_MIME = "audio/webm";
 
+const ERROR_PARSE = "Не получилось разобрать, попробуйте ещё раз.";
+const ERROR_GENERIC = "Что-то сломалось, попробуйте ещё раз.";
+const ERROR_EMPTY = "Ничего не расслышал, скажите ещё раз.";
+const ERROR_MIC = "Нужен доступ к микрофону";
+
 type FeedItem =
   | { id: string; kind: "user"; text: string }
   | { id: string; kind: "assistant"; result: RespondResult }
@@ -28,6 +33,16 @@ function startFeed(): FeedItem[] {
 
 function startHistory(): Message[] {
   return [{ role: "assistant", text: START_MESSAGE }];
+}
+
+/** Маршрут помечает причину: parse — мусор от модели, failed — всё остальное. */
+async function readErrorKind(res: Response): Promise<string> {
+  try {
+    const data = (await res.json()) as { error?: string };
+    return data.error === "parse" ? "parse" : "failed";
+  } catch {
+    return "failed";
+  }
 }
 
 function formatTime(total: number) {
@@ -74,33 +89,44 @@ export default function Page() {
     const pendingId = newId();
     append({ id: pendingId, kind: "pending", label: "Думаю..." });
 
-    const res = await fetch("/api/respond", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ history, userText: text }),
-    });
+    try {
+      const res = await fetch("/api/respond", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ history, userText: text }),
+      });
 
-    if (!res.ok) {
+      if (!res.ok) {
+        const kind = await readErrorKind(res);
+        replace(pendingId, {
+          id: pendingId,
+          kind: "notice",
+          text: kind === "parse" ? ERROR_PARSE : ERROR_GENERIC,
+        });
+        return;
+      }
+
+      const result = (await res.json()) as RespondResult;
+      replace(pendingId, { id: pendingId, kind: "assistant", result });
+
+      // В историю идёт сырая реплика пользователя и только reply бота.
+      // Corrected и explanation в историю не попадают никогда.
+      setHistory((prev) =>
+        [
+          ...prev,
+          { role: "user" as const, text },
+          { role: "assistant" as const, text: result.reply },
+        ].slice(-HISTORY_LIMIT),
+      );
+    } catch (error) {
+      // Сеть отвалилась до ответа сервера.
+      console.error("Запрос к /api/respond не дошёл", error);
       replace(pendingId, {
         id: pendingId,
         kind: "notice",
-        text: "Не получилось разобрать, попробуйте ещё раз.",
+        text: ERROR_GENERIC,
       });
-      return;
     }
-
-    const result = (await res.json()) as RespondResult;
-    replace(pendingId, { id: pendingId, kind: "assistant", result });
-
-    // В историю идёт сырая реплика пользователя и только reply бота.
-    // Corrected и explanation в историю не попадают никогда.
-    setHistory((prev) =>
-      [
-        ...prev,
-        { role: "user" as const, text },
-        { role: "assistant" as const, text: result.reply },
-      ].slice(-HISTORY_LIMIT),
-    );
   }
 
   async function sendText(userText: string) {
@@ -134,7 +160,7 @@ export default function Page() {
         replace(listeningId, {
           id: listeningId,
           kind: "notice",
-          text: "Что-то сломалось, попробуйте ещё раз.",
+          text: ERROR_GENERIC,
         });
         return;
       }
@@ -142,17 +168,25 @@ export default function Page() {
       const { text } = (await res.json()) as { text: string };
       const userText = text.trim();
 
+      // Пустая транскрипция: в историю не пишем ничего.
       if (!userText) {
         replace(listeningId, {
           id: listeningId,
           kind: "notice",
-          text: "Ничего не расслышал, скажите ещё раз.",
+          text: ERROR_EMPTY,
         });
         return;
       }
 
       replace(listeningId, { id: listeningId, kind: "user", text: userText });
       await runRespond(userText);
+    } catch (error) {
+      console.error("Запрос к /api/transcribe не дошёл", error);
+      replace(listeningId, {
+        id: listeningId,
+        kind: "notice",
+        text: ERROR_GENERIC,
+      });
     } finally {
       setBusy(false);
     }
@@ -211,7 +245,13 @@ export default function Page() {
       );
     } catch (error) {
       console.error("Не удалось начать запись", error);
-      setMicError("Нужен доступ к микрофону");
+
+      // Отказ в доступе — одно сообщение, любая другая причина — другое.
+      const denied =
+        error instanceof DOMException &&
+        (error.name === "NotAllowedError" || error.name === "SecurityError");
+
+      setMicError(denied ? ERROR_MIC : ERROR_GENERIC);
     }
   }
 
